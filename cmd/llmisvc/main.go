@@ -38,6 +38,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"knative.dev/pkg/apiextensions/storageversion"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -58,7 +59,6 @@ import (
 	kservemetrics "github.com/kserve/kserve/pkg/metrics"
 	"github.com/kserve/kserve/pkg/oteljson"
 	kservescheme "github.com/kserve/kserve/pkg/scheme"
-	kservetls "github.com/kserve/kserve/pkg/tls"
 	llmisvcwebhook "github.com/kserve/kserve/pkg/webhook/admission/llminferenceservice"
 )
 
@@ -175,34 +175,14 @@ func main() {
 	})
 
 	var tlsOpts []func(*tls.Config)
-	switch {
-	case options.tlsMinVersion != "" || options.tlsCipherSuites != "":
-		var err error
-		tlsOpts, err = resolveTLS(ctx, cfg, options.tlsMinVersion, options.tlsCipherSuites)
-		if err != nil {
-			setupLog.Error(err, "unable to resolve TLS configuration")
-			os.Exit(1)
-		}
-	case enableHTTP2Set:
+	if enableHTTP2Set && options.tlsMinVersion == "" && options.tlsCipherSuites == "" {
 		setupLog.Info("WARNING: --enable-http2 is deprecated and will be removed in a future release. " +
 			"CVE-2023-44487 is fixed in Go 1.21.3+. Use --tls-min-version and --tls-cipher-suites instead.")
-		if !options.enableHTTP2 {
-			tlsOpts = kservetls.LegacyHTTP2TLSOpts()
-		} else {
-			var err error
-			tlsOpts, err = resolveTLS(ctx, cfg, "", "")
-			if err != nil {
-				setupLog.Error(err, "unable to resolve TLS configuration")
-				os.Exit(1)
-			}
-		}
-	default:
-		var err error
-		tlsOpts, err = resolveTLS(ctx, cfg, "", "")
-		if err != nil {
-			setupLog.Error(err, "unable to resolve TLS configuration")
-			os.Exit(1)
-		}
+	}
+	tlsOpts, err = selectTLSOpts(ctx, cfg, options, enableHTTP2Set, resolveTLS)
+	if err != nil {
+		setupLog.Error(err, "unable to resolve TLS configuration")
+		os.Exit(1)
 	}
 
 	metricsServerOptions, err := kservemetrics.ConfigureServerOptions(metricsserver.Options{
@@ -422,6 +402,26 @@ func main() {
 // wellKnownConfigChecker returns true if the given config name is a well-known config.
 func wellKnownConfigChecker(name string) bool {
 	return llmisvc.WellKnownDefaultConfigs.Has(name)
+}
+
+// selectTLSOpts builds the TLS options for the manager. Explicit --tls-min-version /
+// --tls-cipher-suites flags win; otherwise the cluster policy is resolved. When the
+// deprecated --enable-http2 flag is explicitly false, only the ALPN protocol list is
+// restricted to http/1.1: min version and cipher suites stay policy-derived.
+func selectTLSOpts(ctx context.Context, cfg *rest.Config, opts Options, enableHTTP2Set bool, resolve func(context.Context, *rest.Config, string, string) ([]func(*tls.Config), error)) ([]func(*tls.Config), error) {
+	if opts.tlsMinVersion != "" || opts.tlsCipherSuites != "" {
+		return resolve(ctx, cfg, opts.tlsMinVersion, opts.tlsCipherSuites)
+	}
+	tlsOpts, err := resolve(ctx, cfg, "", "")
+	if err != nil {
+		return nil, err
+	}
+	if enableHTTP2Set && !opts.enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) {
+			c.NextProtos = []string{"http/1.1"}
+		})
+	}
+	return tlsOpts, nil
 }
 
 // validateLLMISVCConfig validates a v1alpha2 LLMInferenceServiceConfig by loading the controller
