@@ -46,7 +46,7 @@ var _ = Describe("LLMInferenceService Monitoring NetworkPolicy", func() {
 			EnableMonitoringIngressNetworkPolicy(ctx, envTest.Client)
 		})
 
-		It("should not create the NetworkPolicy when the monitoring ingress gate is off", func(ctx SpecContext) {
+		It("should create a compatibility NetworkPolicy when the monitoring ingress gate is off", func(ctx SpecContext) {
 			PatchLLMISVCConfig(ctx, envTest.Client, func(cfg *llmisvc.LLMISVCConfig) {
 				cfg.FeatureGates.MonitoringIngressNetworkPolicy = false
 			})
@@ -60,16 +60,27 @@ var _ = Describe("LLMInferenceService Monitoring NetworkPolicy", func() {
 			Expect(envTest.Create(ctx, llmSvc)).To(Succeed())
 			defer testNs.DeleteAndWait(ctx, llmSvc)
 
-			Consistently(func(g Gomega, ctx context.Context) {
-				err := envTest.Get(ctx, types.NamespacedName{
-					Name:      kmeta.ChildName(svcName, "-prometheus-scraping"),
-					Namespace: testNs.Name,
-				}, &netv1.NetworkPolicy{})
-				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
-			}).WithContext(ctx).Should(Succeed())
+			np := waitForMonitoringNetworkPolicy(ctx, testNs.Name, svcName)
+
+			By("verifying the compatibility policy is workload-scoped and permits required traffic")
+			Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
+				constants.KubernetesPartOfLabelKey, constants.LLMInferenceServicePartOfValue))
+			Expect(np.Spec.PodSelector.MatchLabels).To(HaveKeyWithValue(
+				constants.KubernetesAppNameLabelKey, svcName))
+			Expect(np.OwnerReferences).To(HaveLen(1))
+			Expect(np.OwnerReferences[0].Name).To(Equal(svcName))
+
+			By("verifying ingress allows any source on documented service ports")
+			Expect(np.Spec.Ingress).To(HaveLen(1))
+			Expect(np.Spec.Ingress[0].From).To(BeEmpty())
+			Expect(np.Spec.Ingress[0].Ports).To(HaveLen(2))
+
+			By("verifying explicit egress behavior")
+			Expect(np.Spec.PolicyTypes).To(ContainElement(netv1.PolicyTypeEgress))
+			Expect(np.Spec.Egress).To(HaveLen(1))
 		})
 
-		It("should remove its NetworkPolicy when the monitoring ingress gate is turned off", func(ctx SpecContext) {
+		It("should update to a compatibility NetworkPolicy when the monitoring ingress gate is turned off", func(ctx SpecContext) {
 			svcName := "test-llm-netpol-gate-turned-off"
 			testNs := NewTestNamespace(ctx, envTest)
 			llmSvc := LLMInferenceService(svcName,
@@ -86,11 +97,16 @@ var _ = Describe("LLMInferenceService Monitoring NetworkPolicy", func() {
 			})
 
 			Eventually(func(g Gomega, ctx context.Context) {
-				err := envTest.Get(ctx, types.NamespacedName{
+				np := &netv1.NetworkPolicy{}
+				g.Expect(envTest.Get(ctx, types.NamespacedName{
 					Name:      kmeta.ChildName(svcName, "-prometheus-scraping"),
 					Namespace: testNs.Name,
-				}, &netv1.NetworkPolicy{})
-				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				}, np)).To(Succeed())
+
+				By("policy must still exist with compatibility rules")
+				g.Expect(np.Spec.Ingress).To(HaveLen(1))
+				g.Expect(np.Spec.Ingress[0].From).To(BeEmpty())
+				g.Expect(np.Spec.PolicyTypes).To(ContainElement(netv1.PolicyTypeEgress))
 			}).WithContext(ctx).Should(Succeed())
 		})
 

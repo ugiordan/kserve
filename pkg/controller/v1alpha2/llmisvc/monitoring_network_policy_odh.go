@@ -174,18 +174,88 @@ func (r *LLMISVCReconciler) reconcileNetworkPolicies(ctx context.Context, llmSvc
 		return r.deleteOwnedMonitoringNetworkPolicy(ctx, llmSvc)
 	}
 
-	if config == nil || !config.FeatureGates.MonitoringIngressNetworkPolicy {
-		return r.deleteOwnedMonitoringNetworkPolicy(ctx, llmSvc)
+	var expected *netv1.NetworkPolicy
+	if config != nil && config.FeatureGates.MonitoringIngressNetworkPolicy {
+		logger.Info("Reconciling restrictive monitoring NetworkPolicy for Prometheus scraping")
+		expected = expectedMonitoringNetworkPolicy(llmSvc, ingressNamespace(config), config)
+	} else {
+		logger.Info("Reconciling compatibility NetworkPolicy to preserve traffic under default-deny baselines")
+		expected = expectedCompatibilityNetworkPolicy(llmSvc)
 	}
 
-	logger.Info("Reconciling monitoring NetworkPolicy for Prometheus scraping")
-
-	expected := expectedMonitoringNetworkPolicy(llmSvc, ingressNamespace(config), config)
 	if err := Reconcile(ctx, r, llmSvc, &netv1.NetworkPolicy{}, expected, semanticNetworkPolicyIsEqual); err != nil {
+		if isTracingNetworkPolicyOwnershipConflict(err, expected, llmSvc) {
+			r.Eventf(llmSvc, corev1.EventTypeWarning, monitoringNetworkPolicyNotOwnedReason,
+				"Monitoring NetworkPolicy %s/%s is not controlled by this LLMInferenceService; leaving it unchanged",
+				expected.GetNamespace(), expected.GetName())
+			return nil
+		}
 		return fmt.Errorf("failed to reconcile monitoring network policy %s/%s: %w", expected.GetNamespace(), expected.GetName(), err)
 	}
 
 	return nil
+}
+
+// expectedCompatibilityNetworkPolicy returns a per-service NetworkPolicy that
+// preserves required traffic when the restrictive monitoring ingress gate is
+// off. Per the ODH-ADR-Operator-0016 compatibility profile, the policy must
+// always exist so the workload remains reachable under an administrator's
+// default-deny baseline. It allows ingress from any source on the workload's
+// documented service ports and declares allow-all egress explicitly.
+func expectedCompatibilityNetworkPolicy(llmSvc *v1alpha2.LLMInferenceService) *netv1.NetworkPolicy {
+	vllmPort := intstr.FromInt32(8000)
+	eppExtProcPort := intstr.FromInt32(9002)
+	tcp := corev1.ProtocolTCP
+
+	return &netv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      monitoringNetworkPolicyName(llmSvc),
+			Namespace: llmSvc.GetNamespace(),
+			Labels: map[string]string{
+				constants.KubernetesComponentLabelKey: "llm-monitoring",
+				constants.KubernetesPartOfLabelKey:    constants.LLMInferenceServicePartOfValue,
+				constants.KubernetesAppNameLabelKey:   llmSvc.GetName(),
+			},
+			Annotations: map[string]string{
+				"llmisvc.networkpolicy/compatibility": "true",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(llmSvc, v1alpha2.LLMInferenceServiceGVK),
+			},
+		},
+		Spec: netv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					constants.KubernetesPartOfLabelKey:  constants.LLMInferenceServicePartOfValue,
+					constants.KubernetesAppNameLabelKey: llmSvc.GetName(),
+				},
+			},
+			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress, netv1.PolicyTypeEgress},
+			Ingress: []netv1.NetworkPolicyIngressRule{
+				// Compatibility profile: allow any source to reach the workload's
+				// documented service ports so existing callers continue to work
+				// (RHAI-4088 upgrade regression, OCP 5 default-deny baselines).
+				{
+					Ports: []netv1.NetworkPolicyPort{
+						{
+							Protocol: &tcp,
+							Port:     &vllmPort,
+						},
+						{
+							Protocol: &tcp,
+							Port:     &eppExtProcPort,
+						},
+					},
+				},
+			},
+			// Explicit allow-all egress per ADR requirement. LLMISVC workloads
+			// need unrestricted outbound (model downloads, storage, DNS, etc.)
+			// that cannot be represented with narrow peers.
+			Egress: []netv1.NetworkPolicyEgressRule{
+				{},
+			},
+		},
+	}
 }
 
 // deleteOwnedMonitoringNetworkPolicy removes the per-service monitoring policy
